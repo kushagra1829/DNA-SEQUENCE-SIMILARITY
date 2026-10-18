@@ -3,9 +3,6 @@
 
 [![Language: C++17](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Compiler: GCC 16.1.0](https://img.shields.io/badge/Compiler-GCC%2016.1.0-brightgreen.svg)](https://gcc.gnu.org/)
-[![Optimization: -O2](https://img.shields.io/badge/Optimization--O2-orange.svg)]()
-[![Tests: 9/9 Passed](https://img.shields.io/badge/Correctness%20Tests-9%2F9%20Passed-success.svg)]()
-
 ---
 
 ## 📑 Table of Contents

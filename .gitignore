@@ -1,0 +1,15 @@
+# Executables and build artifacts
+*.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+
+# System and temporary logs
+*.log
+compile_*.txt
+scratch/
+
+# Python cache
+__pycache__/
+*.py[cod]

@@ -1,28 +1,17 @@
 // ============================================================================
-//  DNA Sequence Similarity — Generalized Jaccard Index
-//  Performance Programming Assignment
+// DNA Sequence Similarity — Generalized Jaccard Index
+// Performance Programming Assignment
 //
-//  Design:
-//    Two separate k-mer counting strategies are provided:
-//      countKmers_small(seq, k)  — optimised for SMALL k (hash-map on
-//                                  std::string keys, bucket-friendly for
-//                                  short, highly-repeated keys).
-//      countKmers_large(seq, k)  — optimised for LARGE k (uses string_view
-//                                  for zero-copy key lookup before inserting,
-//                                  reduces allocation pressure for long, mostly-
-//                                  unique keys that appear infrequently).
-//
-//    The THRESHOLD between "small" and "large" is determined experimentally
-//    at programme start by a calibration phase that measures real execution
-//    time on the current machine.  It is NOT a fixed theoretical constant.
-//
-//  Build (GCC / MinGW, release):
-//    g++ -O2 -std=c++17 -o dna_sim main.cpp
-//
-//  Output files written to the current working directory:
-//    results_benchmark.csv    — Experiment A & B data
-//    results_mutation.csv     — Experiment C data
-//    calibration_log.csv      — raw calibration timings used to pick threshold
+// Key Architectural Features:
+// 1. 2-bit quaternary integer encoding (A=00, C=01, G=10, T=11) in uint64_t (k<=32).
+//    Rolling hash extraction: ((code << 2) & mask) | new_base (zero heap churn).
+// 2. Strategy A (Small k <= 13): Direct 4^k flat counter array. Single-pass linear scan.
+// 3. Strategy B (Large k): Zero-copy integer vector, std::sort (Introsort, O(n log n)),
+//    and two-pointer linear merge-walk (O(|A| + |B|)).
+// 4. Empirical calibration: Automatically measures crossover threshold on startup.
+// 5. Dual-length calibration stability verification.
+// 6. 9 automated correctness tests + independent reference implementation.
+// 7. Full benchmark suite (lengths 1k..1M, k=1..32) + 32-k mutation sensitivity.
 // ============================================================================
 
 #include <algorithm>
@@ -30,7 +19,6 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
-#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -39,298 +27,339 @@
 #include <random>
 #include <set>
 #include <string>
-#include <string_view>
-#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// Type aliases
+// High-resolution clock utilities
 // ---------------------------------------------------------------------------
-using FreqMap   = std::unordered_map<std::string, int>;
-using Clock     = std::chrono::steady_clock;
-using Seconds   = std::chrono::duration<double>;
+using Clock   = std::chrono::steady_clock;
+using Seconds = std::chrono::duration<double>;
 
-// ---------------------------------------------------------------------------
-// Utility: high-resolution elapsed time
-// ---------------------------------------------------------------------------
 inline double elapsed_sec(Clock::time_point start) {
     return Seconds(Clock::now() - start).count();
 }
+
+// ---------------------------------------------------------------------------
+// 2-bit Integer Encoding Utilities
+// ---------------------------------------------------------------------------
+// A = 00 (0), C = 01 (1), G = 10 (2), T = 11 (3)
+inline uint8_t baseToBits(char c) {
+    switch (c) {
+        case 'A': case 'a': return 0b00;
+        case 'C': case 'c': return 0b01;
+        case 'G': case 'g': return 0b10;
+        case 'T': case 't': return 0b11;
+        default: return 0b00;
+    }
+}
+
+// Bitmask for lowest 2*k bits. Avoids 1ULL << 64 undefined behavior when k=32.
+inline uint64_t getKmerMask(int k) {
+    if (k >= 32) return ~0ULL;
+    return (1ULL << (2 * k)) - 1ULL;
+}
+
+// Decode a 64-bit integer code back into DNA text string
+inline std::string decodeKmer(uint64_t code, int k) {
+    std::string s(k, 'A');
+    const char bases[] = {'A', 'C', 'G', 'T'};
+    for (int i = k - 1; i >= 0; --i) {
+        s[i] = bases[code & 0b11];
+        code >>= 2;
+    }
+    return s;
+}
+
+// Max k for Strategy A direct array (4^13 counters * 4 bytes = 268 MB)
+constexpr int MAX_SMALL_K = 13;
+
+// Global threshold determined dynamically during startup calibration
+int g_threshold = 11;
+
+// ---------------------------------------------------------------------------
+// Data structures for k-mer counts
+// ---------------------------------------------------------------------------
+struct KmerCount {
+    uint64_t kmer;
+    uint32_t count;
+};
 
 // ===========================================================================
 // SECTION 1 — k-mer counting  (TWO SEPARATE IMPLEMENTATIONS)
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Strategy A — SMALL k
-//   For small k the number of distinct k-mers is bounded by min(4^k, n-k+1).
-//   At k≤8 there are at most 65 536 distinct keys.  Strings are short, hash
-//   cost is low, and bucket contention is manageable.  We use a pre-reserved
-//   unordered_map and insert std::string keys directly.
+// Strategy A — SMALL k (Direct array indexing in 4^k slots)
 // ---------------------------------------------------------------------------
-FreqMap countKmers_small(const std::string& seq, int k) {
-    FreqMap freq;
-    if (k <= 0 || static_cast<int>(seq.size()) < k) return freq;
-
-    // Reserve a reasonable number of buckets to avoid rehashing.
-    // For small k (k <= 12), 4^k is the maximum number of distinct k-mers.
-    // For k >= 13, 4^k exceeds practical DNA distinct k-mers so we bound by n-k+1.
-    size_t n_kmers = static_cast<size_t>(seq.size() - k + 1);
-    size_t reserve_count = n_kmers;
-    if (k <= 12) {
-        size_t p4 = 1ULL << (2 * k); // 4^k = 2^(2k)
-        if (p4 < reserve_count) reserve_count = p4;
+std::vector<uint32_t> countKmers_small(const std::string& seq, int k) {
+    if (k <= 0 || static_cast<int>(seq.size()) < k || k > MAX_SMALL_K) {
+        return {};
     }
-    freq.reserve(reserve_count);
+
+    const size_t total_slots = 1ULL << (2 * k); // 4^k counters
+    std::vector<uint32_t> counts(total_slots, 0);
+
+    const uint64_t mask = getKmerMask(k);
+    uint64_t code = 0;
+    for (int i = 0; i < k; ++i) {
+        code = (code << 2) | baseToBits(seq[i]);
+    }
+    counts[code]++;
 
     const int n = static_cast<int>(seq.size());
-    for (int i = 0; i <= n - k; ++i) {
-        freq[seq.substr(i, k)]++;
+    for (int i = k; i < n; ++i) {
+        code = ((code << 2) & mask) | baseToBits(seq[i]);
+        counts[code]++;
     }
-    return freq;
+    return counts;
+}
+
+inline double jaccard_small_from_counts(const std::vector<uint32_t>& cA,
+                                        const std::vector<uint32_t>& cB) {
+    if (cA.empty() && cB.empty()) return 1.0;
+    if (cA.empty() || cB.empty()) return 0.0;
+
+    uint64_t sum_min = 0, sum_max = 0;
+    const size_t sz = cA.size();
+    for (size_t i = 0; i < sz; ++i) {
+        uint32_t a = cA[i];
+        uint32_t b = cB[i];
+        sum_min += std::min(a, b);
+        sum_max += std::max(a, b);
+    }
+    return (sum_max == 0) ? 1.0 : static_cast<double>(sum_min) / static_cast<double>(sum_max);
 }
 
 // ---------------------------------------------------------------------------
-// Strategy B — LARGE k
-//   For large k, keys are long and repeated k-mers waste heap memory if
-//   materialized as std::string prior to map insertion.  Here we use zero-copy
-//   std::string_view stored in a contiguous std::vector, sort lexicographically
-//   with high cache locality, and perform run-length consolidation.
-//   std::string keys are instantiated ONLY ONCE per UNIQUE k-mer, eliminating
-//   heap churn and fragmentation for repeated sequences.
+// Strategy B — LARGE k (Contiguous 64-bit integer sort + run-length consolidation)
 // ---------------------------------------------------------------------------
-FreqMap countKmers_large(const std::string& seq, int k) {
-    FreqMap freq;
-    if (k <= 0 || static_cast<int>(seq.size()) < k) return freq;
+std::vector<KmerCount> countKmers_large(const std::string& seq, int k) {
+    if (k <= 0 || static_cast<int>(seq.size()) < k) return {};
 
     const int n = static_cast<int>(seq.size());
     const int num_kmers = n - k + 1;
 
-    std::vector<std::string_view> views;
-    views.reserve(num_kmers);
-    for (int i = 0; i < num_kmers; ++i) {
-        views.emplace_back(seq.data() + i, k);
+    std::vector<uint64_t> codes;
+    codes.reserve(num_kmers);
+
+    const uint64_t mask = getKmerMask(k);
+    uint64_t code = 0;
+    for (int i = 0; i < k; ++i) {
+        code = (code << 2) | baseToBits(seq[i]);
+    }
+    codes.push_back(code);
+
+    for (int i = k; i < n; ++i) {
+        code = ((code << 2) & mask) | baseToBits(seq[i]);
+        codes.push_back(code);
     }
 
-    std::sort(views.begin(), views.end());
+    std::sort(codes.begin(), codes.end());
 
-    // Single pass run-length consolidation: allocate std::string only for unique k-mers
-    freq.reserve(num_kmers);
-    int run_len = 1;
-    for (size_t i = 1; i < views.size(); ++i) {
-        if (views[i] == views[i - 1]) {
+    std::vector<KmerCount> runs;
+    runs.reserve(std::min<size_t>(num_kmers, 1ULL << (std::min(k, 16) * 2)));
+
+    uint32_t run_len = 1;
+    for (size_t i = 1; i < codes.size(); ++i) {
+        if (codes[i] == codes[i - 1]) {
             ++run_len;
         } else {
-            freq.emplace(std::string(views[i - 1]), run_len);
+            runs.push_back({codes[i - 1], run_len});
             run_len = 1;
         }
     }
-    if (!views.empty()) {
-        freq.emplace(std::string(views.back()), run_len);
+    if (!codes.empty()) {
+        runs.push_back({codes.back(), run_len});
     }
-    return freq;
+    return runs;
+}
+
+inline double jaccard_large_from_runs(const std::vector<KmerCount>& rA,
+                                      const std::vector<KmerCount>& rB) {
+    if (rA.empty() && rB.empty()) return 1.0;
+    if (rA.empty() || rB.empty()) return 0.0;
+
+    uint64_t sum_min = 0, sum_max = 0;
+    size_t i = 0, j = 0;
+    while (i < rA.size() && j < rB.size()) {
+        if (rA[i].kmer == rB[j].kmer) {
+            sum_min += std::min(rA[i].count, rB[j].count);
+            sum_max += std::max(rA[i].count, rB[j].count);
+            ++i; ++j;
+        } else if (rA[i].kmer < rB[j].kmer) {
+            sum_max += rA[i].count;
+            ++i;
+        } else {
+            sum_max += rB[j].count;
+            ++j;
+        }
+    }
+    while (i < rA.size()) { sum_max += rA[i++].count; }
+    while (j < rB.size()) { sum_max += rB[j++].count; }
+
+    return (sum_max == 0) ? 1.0 : static_cast<double>(sum_min) / static_cast<double>(sum_max);
 }
 
 // ===========================================================================
-// SECTION 2 — Calibration: find the experimental threshold
+// SECTION 2 — Unified Jaccard Computation & Timed Execution
 // ===========================================================================
 
-// We benchmark countKmers_small vs countKmers_large on a shared fixed test
-// sequence for k = 1..32, record average timings, and return the first k
-// at which countKmers_large becomes faster (or stays within 5% of small).
-// If large is never faster, we default to the midpoint k=16 as a safe fallback.
-
-struct CalibrationResult {
-    int threshold;                       // k value at which we switch
-    std::vector<double> time_small_ms;   // avg time (ms) per k for small
-    std::vector<double> time_large_ms;   // avg time (ms) per k for large
+struct JaccardResult {
+    double similarity;
+    double time_count_ms;
+    double time_jaccard_ms;
+    double total_ms;
 };
 
-CalibrationResult calibrate(int calib_len = 50000, int repeats = 5) {
-    std::cout << "[Calibration] Generating test sequence of length "
-              << calib_len << " (repeats=" << repeats << ")...\n";
+JaccardResult computeJaccardTimed(const std::string& seqA,
+                                  const std::string& seqB,
+                                  int k,
+                                  int threshold) {
+    if (k <= 0) return {0.0, 0.0, 0.0, 0.0};
+    const bool a_short = static_cast<int>(seqA.size()) < k;
+    const bool b_short = static_cast<int>(seqB.size()) < k;
+    if (a_short && b_short) return {1.0, 0.0, 0.0, 0.0};
+    if (a_short || b_short) return {0.0, 0.0, 0.0, 0.0};
 
-    // Fixed seed for reproducibility
+    if (k < threshold && k <= MAX_SMALL_K) {
+        // Strategy A: Direct array counting
+        auto t0 = Clock::now();
+        auto cA = countKmers_small(seqA, k);
+        auto cB = countKmers_small(seqB, k);
+        double count_ms = elapsed_sec(t0) * 1000.0;
+
+        auto t1 = Clock::now();
+        double sim = jaccard_small_from_counts(cA, cB);
+        double jacc_ms = elapsed_sec(t1) * 1000.0;
+
+        return {sim, count_ms, jacc_ms, count_ms + jacc_ms};
+    } else {
+        // Strategy B: Zero-copy sort + two-pointer merge walk
+        auto t0 = Clock::now();
+        auto rA = countKmers_large(seqA, k);
+        auto rB = countKmers_large(seqB, k);
+        double count_ms = elapsed_sec(t0) * 1000.0;
+
+        auto t1 = Clock::now();
+        double sim = jaccard_large_from_runs(rA, rB);
+        double jacc_ms = elapsed_sec(t1) * 1000.0;
+
+        return {sim, count_ms, jacc_ms, count_ms + jacc_ms};
+    }
+}
+
+double generalizedJaccard(const std::string& seqA, const std::string& seqB, int k) {
+    return computeJaccardTimed(seqA, seqB, k, g_threshold).similarity;
+}
+
+struct TimedResult {
+    double similarity;
+    double time_count_ms;
+    double time_jaccard_ms;
+    double total_ms;
+};
+
+TimedResult timedJaccard(const std::string& seqA, const std::string& seqB, int k) {
+    auto r = computeJaccardTimed(seqA, seqB, k, g_threshold);
+    return {r.similarity, r.time_count_ms, r.time_jaccard_ms, r.total_ms};
+}
+
+// ===========================================================================
+// SECTION 3 — Calibration & Stability Verification
+// ===========================================================================
+
+struct CalibrationResult {
+    int threshold;
+    std::vector<double> time_small_ms;
+    std::vector<double> time_large_ms;
+};
+
+std::string generateDNA(int length, std::mt19937& rng);
+
+CalibrationResult runSingleCalibration(int calib_len, int repeats, std::ofstream& log) {
+    std::cout << "[Calibration] Benchmarking length " << calib_len
+              << " bp (repeats=" << repeats << ")...\n";
+
     std::mt19937 rng(42);
-    const char bases[] = {'A', 'C', 'G', 'T'};
-    std::uniform_int_distribution<int> base_dist(0, 3);
-
-    std::string seq(calib_len, 'A');
-    for (char& c : seq) c = bases[base_dist(rng)];
+    std::string seq = generateDNA(calib_len, rng);
 
     CalibrationResult cr;
-    cr.time_small_ms.resize(33, 0.0);
-    cr.time_large_ms.resize(33, 0.0);
-
-    std::ofstream log("calibration_log.csv");
-    log << "k,strategy,avg_time_ms\n";
+    cr.time_small_ms.resize(33, -1.0);
+    cr.time_large_ms.resize(33, -1.0);
 
     for (int k = 1; k <= 32; ++k) {
-        // --- small strategy ---
-        double total_s = 0.0;
-        bool small_ok = true;
-        for (int r = 0; r < repeats; ++r) {
-            try {
+        // Strategy A timing (only if within memory budget)
+        if (k <= MAX_SMALL_K) {
+            double tot_s = 0.0;
+            for (int r = 0; r < repeats; ++r) {
                 auto t0 = Clock::now();
-                auto fm = countKmers_small(seq, k);
-                total_s += elapsed_sec(t0);
-                (void)fm.size();
-            } catch (const std::bad_alloc&) {
-                small_ok = false; break;
+                auto c = countKmers_small(seq, k);
+                tot_s += elapsed_sec(t0);
+                (void)c.size();
             }
+            cr.time_small_ms[k] = (tot_s / repeats) * 1000.0;
+        } else {
+            cr.time_small_ms[k] = -1.0; // Exceeds budget -> memory wall guard
         }
-        cr.time_small_ms[k] = small_ok ? (total_s / repeats) * 1000.0 : -1.0;
 
-        // --- large strategy ---
-        double total_l = 0.0;
-        bool large_ok = true;
+        // Strategy B timing (all k)
+        double tot_l = 0.0;
         for (int r = 0; r < repeats; ++r) {
-            try {
-                auto t0 = Clock::now();
-                auto fm = countKmers_large(seq, k);
-                total_l += elapsed_sec(t0);
-                (void)fm.size();
-            } catch (const std::bad_alloc&) {
-                large_ok = false; break;
-            }
+            auto t0 = Clock::now();
+            auto runs = countKmers_large(seq, k);
+            tot_l += elapsed_sec(t0);
+            (void)runs.size();
         }
-        cr.time_large_ms[k] = large_ok ? (total_l / repeats) * 1000.0 : -1.0;
+        cr.time_large_ms[k] = (tot_l / repeats) * 1000.0;
 
-        log << k << ",small," << cr.time_small_ms[k] << "\n";
-        log << k << ",large," << cr.time_large_ms[k] << "\n";
+        log << calib_len << "," << k << ",small," << cr.time_small_ms[k] << "\n";
+        log << calib_len << "," << k << ",large," << cr.time_large_ms[k] << "\n";
 
-        std::string s_str = small_ok
-            ? (std::to_string(static_cast<int>(cr.time_small_ms[k]*1000)/1000.0).substr(0,6) + "ms")
-            : "OOM";
-        std::string l_str = large_ok
-            ? (std::to_string(static_cast<int>(cr.time_large_ms[k]*1000)/1000.0).substr(0,6) + "ms")
-            : "OOM";
+        std::string s_str = (cr.time_small_ms[k] >= 0.0)
+            ? (std::to_string(cr.time_small_ms[k]).substr(0, 6) + "ms")
+            : "WALL (>268MB)";
+        std::string l_str = std::to_string(cr.time_large_ms[k]).substr(0, 6) + "ms";
 
         std::cout << "  k=" << std::setw(2) << k
-                  << "  small=" << s_str
-                  << "  large=" << l_str << "\n";
+                  << "  small=" << std::setw(15) << s_str
+                  << "  large=" << std::setw(10) << l_str << "\n";
     }
 
-    // Find first k where large is faster (within 5% margin to avoid noise)
-    // If no crossover is found, keep using small for all k (threshold = 33).
-    cr.threshold = 33; // default: small strategy wins across all k=1..32
+    // Find crossover threshold
+    cr.threshold = MAX_SMALL_K + 1; // Default upper bound
     for (int k = 1; k <= 32; ++k) {
-        double small_t = cr.time_small_ms[k];
-        double large_t = cr.time_large_ms[k];
-        if (small_t > 0 && large_t > 0 && large_t < small_t * 0.95) {   // large is at least 5% faster
+        if (cr.time_small_ms[k] < 0.0) {
+            cr.threshold = k; // Strategy A hit the memory wall
+            break;
+        }
+        if (cr.time_large_ms[k] < cr.time_small_ms[k] * 0.95) {
             cr.threshold = k;
             break;
         }
     }
-
-    if (cr.threshold > 32) {
-        std::cout << "[Calibration] No crossover found: small strategy is faster"
-                     " for ALL k=1..32 on this machine.\n";
-        std::cout << "[Calibration] Threshold set to 33 (small used for all k).\n\n";
-    } else {
-        std::cout << "[Calibration] Experimental threshold = k=" << cr.threshold
-                  << "  (large strategy used for k>=" << cr.threshold << ")\n\n";
-    }
     return cr;
 }
 
-// ===========================================================================
-// SECTION 3 — Unified dispatcher
-// ===========================================================================
+void calibrateAndVerifyStability() {
+    std::ofstream log("calibration_log.csv");
+    log << "calib_len,k,strategy,avg_time_ms\n";
 
-// Global threshold set after calibration
-int g_threshold = 17;
+    std::cout << "--- Phase 0: Empirical Calibration & Threshold Determination ---\n";
+    CalibrationResult cal1 = runSingleCalibration(50000, 3, log);
+    std::cout << ">>> Primary Calibration (50k bp): Threshold = k=" << cal1.threshold << "\n\n";
 
-FreqMap countKmers(const std::string& seq, int k) {
-    if (k < g_threshold) {
-        return countKmers_small(seq, k);
-    } else {
-        return countKmers_large(seq, k);
-    }
+    std::cout << "--- Threshold Stability Check (Length = 200,000 bp) ---\n";
+    CalibrationResult cal2 = runSingleCalibration(200000, 2, log);
+    std::cout << ">>> Stability Verification (200k bp): Threshold = k=" << cal2.threshold << "\n\n";
+
+    g_threshold = cal1.threshold;
+    std::cout << ">>> Active Threshold Selected: k=" << g_threshold
+              << " (Strategy A: k<" << g_threshold
+              << ", Strategy B: k>=" << g_threshold << ")\n\n";
 }
 
 // ===========================================================================
-// SECTION 4 — Generalized Jaccard similarity
-// ===========================================================================
-
-double generalizedJaccard(const std::string& seqA,
-                           const std::string& seqB,
-                           int k) {
-    if (k <= 0) return 0.0;
-
-    FreqMap fA = countKmers(seqA, k);
-    FreqMap fB = countKmers(seqB, k);
-
-    if (fA.empty() && fB.empty()) return 1.0; // both too short: identical edge case
-    if (fA.empty() || fB.empty()) return 0.0;
-
-    long long sum_min = 0, sum_max = 0;
-
-    // Iterate over all k-mers in A
-    for (auto& [kmer, cA] : fA) {
-        auto it = fB.find(kmer);
-        int cB = (it != fB.end()) ? it->second : 0;
-        sum_min += std::min(cA, cB);
-        sum_max += std::max(cA, cB);
-    }
-    // Add k-mers present only in B
-    for (auto& [kmer, cB] : fB) {
-        if (fA.find(kmer) == fA.end()) {
-            sum_max += cB; // min is 0
-        }
-    }
-
-    if (sum_max == 0) return 1.0; // degenerate: both empty after filtering
-    return static_cast<double>(sum_min) / static_cast<double>(sum_max);
-}
-
-// Timed variant: returns {similarity, time_count_ms, time_jaccard_ms, total_ms}
-struct TimedResult {
-    double similarity;
-    double time_count_ms;   // time to build both frequency maps
-    double time_jaccard_ms; // time to compute Jaccard from existing maps
-    double total_ms;
-};
-
-TimedResult timedJaccard(const std::string& seqA,
-                          const std::string& seqB,
-                          int k) {
-    if (k <= 0) return {0.0, 0.0, 0.0, 0.0};
-
-    // --- Phase 1: count k-mers ---
-    auto t0 = Clock::now();
-    FreqMap fA = countKmers(seqA, k);
-    FreqMap fB = countKmers(seqB, k);
-    double count_ms = elapsed_sec(t0) * 1000.0;
-
-    // --- Phase 2: compute Jaccard ---
-    auto t1 = Clock::now();
-    long long sum_min = 0, sum_max = 0;
-
-    if (fA.empty() && fB.empty()) {
-        return {1.0, count_ms, 0.0, count_ms};
-    }
-    for (auto& [kmer, cA] : fA) {
-        auto it = fB.find(kmer);
-        int cB = (it != fB.end()) ? it->second : 0;
-        sum_min += std::min(cA, cB);
-        sum_max += std::max(cA, cB);
-    }
-    for (auto& [kmer, cB] : fB) {
-        if (fA.find(kmer) == fA.end()) {
-            sum_max += cB;
-        }
-    }
-
-    double sim = (sum_max == 0) ? 1.0
-                                : static_cast<double>(sum_min) / sum_max;
-    double jaccard_ms = elapsed_sec(t1) * 1000.0;
-
-    return {sim, count_ms, jaccard_ms, count_ms + jaccard_ms};
-}
-
-// ===========================================================================
-// SECTION 5 — DNA sequence generation and mutation
+// SECTION 4 — DNA sequence generation and mutation
 // ===========================================================================
 
 std::string generateDNA(int length, std::mt19937& rng) {
@@ -341,34 +370,51 @@ std::string generateDNA(int length, std::mt19937& rng) {
     return seq;
 }
 
-// Introduce exactly `num_mutations` point mutations (substitutions only).
-// Returns a new string; does not modify the original.
-std::string mutate(const std::string& seq, int num_mutations, std::mt19937& rng) {
+struct MutationResult {
+    std::string mutated;
+    int actual_mutations; // Exact Hamming distance
+};
+
+MutationResult mutateDNA(const std::string& seq, int target_mutations, std::mt19937& rng) {
     std::string mutated = seq;
     const char bases[] = {'A', 'C', 'G', 'T'};
-    std::uniform_int_distribution<int> pos_dist(0, static_cast<int>(seq.size()) - 1);
+    const int n = static_cast<int>(seq.size());
+    std::uniform_int_distribution<int> pos_dist(0, n - 1);
     std::uniform_int_distribution<int> base_dist(0, 3);
 
-    int applied = 0;
-    while (applied < num_mutations) {
-        int pos  = pos_dist(rng);
-        char nb  = bases[base_dist(rng)];
-        if (nb != mutated[pos]) {         // must be a true substitution
+    int attempts = 0;
+    int target = std::min(target_mutations, n);
+    std::vector<bool> changed(n, false);
+    int current_mutations = 0;
+
+    while (current_mutations < target && attempts < target * 10 + 1000) {
+        ++attempts;
+        int pos = pos_dist(rng);
+        char nb = bases[base_dist(rng)];
+        if (nb != mutated[pos]) {
             mutated[pos] = nb;
-            ++applied;
+            if (!changed[pos]) {
+                changed[pos] = true;
+                ++current_mutations;
+            }
         }
     }
-    return mutated;
+
+    int hamming = 0;
+    for (int i = 0; i < n; ++i) {
+        if (seq[i] != mutated[i]) ++hamming;
+    }
+    return {mutated, hamming};
 }
 
 // ===========================================================================
-// SECTION 6 — Correctness test cases
+// SECTION 5 — Correctness Verification Test Cases
 // ===========================================================================
 
 void runTests() {
-    std::cout << "=== Correctness Tests ===\n\n";
+    std::cout << "=== Correctness Tests (T1 - T9) ===\n\n";
 
-    // Test 1: identical sequences → similarity must be 1.0
+    // Test 1: identical sequences -> 1.0
     {
         std::string s = "ATTCGTA";
         double sim = generalizedJaccard(s, s, 3);
@@ -376,18 +422,15 @@ void runTests() {
                   << (std::abs(sim - 1.0) < 1e-9 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 2: completely different alphabet-disjoint sequences
-    //   All-A vs All-C: k-mer sets are disjoint → 0
+    // Test 2: completely disjoint alphabets -> 0.0
     {
         std::string a(10, 'A'), c(10, 'C');
         double sim = generalizedJaccard(a, c, 3);
-        std::cout << "[T2] Completely different (AAAA vs CCCC), k=3: sim=" << sim
+        std::cout << "[T2] Disjoint sequences (AAAA vs CCCC), k=3: sim=" << sim
                   << (sim == 0.0 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 3: hand-calculated example
-    //   seqA = "AACT", k=2 → AA:1, AC:1, CT:1
-    //   seqB = "AACT", k=2 → same → Jaccard = 1.0
+    // Test 3: hand-calculated identical -> 1.0
     {
         std::string a = "AACT", b = "AACT";
         double sim = generalizedJaccard(a, b, 2);
@@ -395,12 +438,7 @@ void runTests() {
                   << (std::abs(sim - 1.0) < 1e-9 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 4: hand-calculated example with partial overlap
-    //   seqA = "AACG", k=2 → {AA:1, AC:1, CG:1}
-    //   seqB = "AATG", k=2 → {AA:1, AT:1, TG:1}
-    //   Intersection: AA → min(1,1)=1   sum_min=1
-    //   Union:        AA→max=1, AC→1, CG→1, AT→1, TG→1  sum_max=5
-    //   Expected Jaccard = 1/5 = 0.2
+    // Test 4: hand-calculated partial overlap -> 1/5 = 0.2
     {
         std::string a = "AACG", b = "AATG";
         double sim = generalizedJaccard(a, b, 2);
@@ -408,17 +446,15 @@ void runTests() {
                   << (std::abs(sim - 0.2) < 1e-9 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 5: repeated pattern
-    //   seqA = "ATATAT", k=2 → {AT:3, TA:2}  (AT appears at 0,2,4; TA at 1,3)
-    //   seqB = "ATATAT" same → Jaccard = 1.0
+    // Test 5: periodic motif -> 1.0
     {
         std::string s = "ATATAT";
         double sim = generalizedJaccard(s, s, 2);
-        std::cout << "[T5] Repeated pattern ATATAT vs itself, k=2: sim=" << sim
+        std::cout << "[T5] Periodic motif ATATAT vs itself, k=2: sim=" << sim
                   << (std::abs(sim - 1.0) < 1e-9 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 6: k larger than sequence → both maps empty → sim=1 by convention
+    // Test 6: k larger than sequence -> 1.0 by convention
     {
         std::string s = "ACG";
         double sim = generalizedJaccard(s, s, 10);
@@ -426,8 +462,7 @@ void runTests() {
                   << (std::abs(sim - 1.0) < 1e-9 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 7: k=1, identical distribution
-    //   "ACGT" vs "TGCA": each base appears exactly once → Jaccard = 1
+    // Test 7: permuted bases with identical distribution -> 1.0
     {
         std::string a = "ACGT", b = "TGCA";
         double sim = generalizedJaccard(a, b, 1);
@@ -435,7 +470,7 @@ void runTests() {
                   << (std::abs(sim - 1.0) < 1e-9 ? "  PASS" : "  FAIL") << "\n";
     }
 
-    // Test 8: k=32 on medium sequence (stress)
+    // Test 8: stress test k=32
     {
         std::mt19937 rng(99);
         std::string s = generateDNA(200, rng);
@@ -456,135 +491,98 @@ void runTests() {
         std::cout << "[T9] Identical seq (len=500), k=1..32 all=1.0: "
                   << (all_pass ? "PASS" : "FAIL") << "\n";
     }
-
     std::cout << "\n";
 }
 
 // ===========================================================================
-// SECTION 7 — Experiment A & B: benchmark sequence length vs k
+// SECTION 6 — Benchmarks: Experiment A & B
 // ===========================================================================
 
 void runBenchmark(const std::string& csv_path) {
-    // Sequence lengths to test.
-    // 1,000,000 bp requires ~2 GB RAM for k-mer maps at large k; it is
-    // attempted but skipped gracefully if the system runs out of memory.
     const std::vector<int> lengths = {1000, 10000, 100000, 500000, 1000000};
-    // k values to test
-    std::vector<int> k_values;
-    for (int k = 1; k <= 32; ++k) k_values.push_back(k);
-
-    const int REPEATS = 5;  // number of timing repetitions per cell
+    const int REPEATS = 5;
 
     std::ofstream csv(csv_path);
-    csv << "seq_len,k,strategy,repetition,"
-        << "similarity,time_count_ms,time_jaccard_ms,total_ms\n";
+    csv << "seq_len,k,strategy,repetition,similarity,time_count_ms,time_jaccard_ms,total_ms\n";
 
     std::mt19937 rng(1234);
-
-    std::cout << "=== Experiment A & B: Benchmark ===\n";
+    std::cout << "=== Experiment A & B: Full Benchmark Suite ===\n";
 
     for (int len : lengths) {
-        std::cout << "\n  Generating sequences of length " << len << "...\n";
+        std::cout << "\n  Generating sequences of length " << len << " bp...\n";
+        std::string seqA = generateDNA(len, rng);
+        std::string seqB = generateDNA(len, rng);
 
-        std::string seqA, seqB;
-        try {
-            seqA = generateDNA(len, rng);
-            seqB = generateDNA(len, rng);
-        } catch (const std::bad_alloc&) {
-            std::cout << "  [SKIP] Out of memory generating sequences of length "
-                      << len << ". Skipping.\n";
-            continue;
-        }
+        for (int k = 1; k <= 32; ++k) {
+            std::string strategy = (k < g_threshold && k <= MAX_SMALL_K) ? "small" : "large";
 
-        bool oom_hit = false;
-        for (int k : k_values) {
-            if (oom_hit) break;
-            std::string strategy = (k < g_threshold) ? "small" : "large";
-
-            // Warm-up run (not recorded)
-            try { auto r = timedJaccard(seqA, seqB, k); (void)r; }
-            catch (const std::bad_alloc&) { oom_hit = true; break; }
+            // Warm-up run
+            auto warm = timedJaccard(seqA, seqB, k);
+            (void)warm;
 
             for (int rep = 1; rep <= REPEATS; ++rep) {
-                try {
-                    auto r = timedJaccard(seqA, seqB, k);
-                    csv << len << "," << k << "," << strategy << "," << rep << ","
-                        << std::fixed << std::setprecision(6)
-                        << r.similarity << ","
-                        << r.time_count_ms << ","
-                        << r.time_jaccard_ms << ","
-                        << r.total_ms << "\n";
-                } catch (const std::bad_alloc&) {
-                    std::cout << "  [OOM] Out of memory at len=" << len
-                              << " k=" << k << ". Skipping remaining k for this length.\n";
-                    oom_hit = true;
-                    break;
-                }
+                auto r = timedJaccard(seqA, seqB, k);
+                csv << len << "," << k << "," << strategy << "," << rep << ","
+                    << std::fixed << std::setprecision(6)
+                    << r.similarity << ","
+                    << r.time_count_ms << ","
+                    << r.time_jaccard_ms << ","
+                    << r.total_ms << "\n";
             }
-            if (!oom_hit)
-                std::cout << "    k=" << std::setw(2) << k
-                          << " [" << strategy << "]  done\n";
+            std::cout << "    k=" << std::setw(2) << k
+                      << " [" << strategy << "] done\n";
         }
     }
-
     std::cout << "\n[Benchmark] Results written to: " << csv_path << "\n\n";
 }
 
 // ===========================================================================
-// SECTION 8 — Experiment C: mutation sensitivity
+// SECTION 7 — Mutation Experiment C (All 32 k-values)
 // ===========================================================================
 
 void runMutationExperiment(const std::string& csv_path) {
     const int SEQ_LEN = 100000;
-    const std::vector<int> k_values = {3, 8, 16, 24, 32};
-    // Mutation percentages (0%, 0.1%, 0.5%, 1%, 2%, 5%, 10%, 20%, 50%)
     const std::vector<double> mut_pcts = {
         0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0
     };
-    const int REPEATS = 3;
+    const int REPEATS = 2; // 2 repeats across all 32 k-values
 
-    std::cout << "=== Experiment C: Mutation Sensitivity ===\n";
-    std::cout << "  Sequence length: " << SEQ_LEN << "\n\n";
+    std::cout << "=== Experiment C: Mutation Sensitivity (All k=1..32) ===\n";
+    std::cout << "  Sequence length: " << SEQ_LEN << " bp\n\n";
 
     std::mt19937 rng(9999);
     std::string original = generateDNA(SEQ_LEN, rng);
 
     std::ofstream csv(csv_path);
-    csv << "seq_len,k,mutation_pct,num_mutations,repetition,"
-        << "similarity,total_ms\n";
+    csv << "seq_len,k,mutation_pct,target_mutations,actual_mutations,repetition,similarity,total_ms\n";
 
-    for (int k : k_values) {
-        std::cout << "  k=" << k << "\n";
+    for (int k = 1; k <= 32; ++k) {
+        std::cout << "  k=" << std::setw(2) << k << ": ";
         for (double pct : mut_pcts) {
-            int num_mut = static_cast<int>(std::round(SEQ_LEN * pct / 100.0));
-            num_mut = std::min(num_mut, SEQ_LEN); // safety cap
+            int target_mut = static_cast<int>(std::round(SEQ_LEN * pct / 100.0));
 
             for (int rep = 1; rep <= REPEATS; ++rep) {
-                std::string mutated = (num_mut == 0)
-                    ? original
-                    : mutate(original, num_mut, rng);
+                MutationResult mr = (target_mut == 0)
+                    ? MutationResult{original, 0}
+                    : mutateDNA(original, target_mut, rng);
 
-                auto r = timedJaccard(original, mutated, k);
+                auto r = timedJaccard(original, mr.mutated, k);
 
                 csv << SEQ_LEN << "," << k << ","
-                    << pct << "," << num_mut << "," << rep << ","
+                    << pct << "," << target_mut << "," << mr.actual_mutations << "," << rep << ","
                     << std::fixed << std::setprecision(6)
                     << r.similarity << "," << r.total_ms << "\n";
             }
-            std::cout << "    mut=" << std::setw(5) << pct << "%"
-                      << "  num_mut=" << std::setw(6) << num_mut << "\n";
         }
+        std::cout << "done\n";
     }
-
     std::cout << "\n[Mutation] Results written to: " << csv_path << "\n\n";
 }
 
 // ===========================================================================
-// SECTION 9 — Interactive Verification Mode & Reference Implementation
+// SECTION 8 — Interactive Verification Mode & Reference Validation
 // ===========================================================================
 
-// Straightforward reference implementation using standard sorted map
-// for cross-verification of optimized implementations.
 double referenceJaccard(const std::string& seqA, const std::string& seqB, int k) {
     if (k <= 0) return 0.0;
     std::map<std::string, int> fA, fB;
@@ -668,12 +666,10 @@ void runInteractiveMode() {
             continue;
         }
 
-        // Compute similarity with timing
         auto t0 = Clock::now();
         double sim = generalizedJaccard(s1, s2, k);
         double elapsed_us = elapsed_sec(t0) * 1e6;
 
-        // Cross-verify with reference implementation
         double ref_sim = referenceJaccard(s1, s2, k);
         bool match = (std::abs(sim - ref_sim) < 1e-9);
 
@@ -683,28 +679,29 @@ void runInteractiveMode() {
         std::cout << "Verification with Reference:   "
                   << (match ? "PASS (Results match reference)" : "FAIL (Discrepancy detected)") << "\n";
         std::cout << "Strategy Selected:             "
-                  << ((k < g_threshold) ? "countKmers_small (Hash Table)" : "countKmers_large (string_view Sort)") << "\n";
+                  << ((k < g_threshold && k <= MAX_SMALL_K) ? "countKmers_small (Direct 4^k Array)" : "countKmers_large (Integer Sort + Merge-Walk)") << "\n";
         std::cout << "Execution Time:                "
                   << std::fixed << std::setprecision(2) << elapsed_us << " us\n";
 
         // For concise sequences (<= 80 bp), display full k-mer frequency table
         if (s1.size() <= 80 && s2.size() <= 80) {
             std::cout << "\nDetailed k-mer Breakdown:\n";
-            FreqMap fA = countKmers(s1, k);
-            FreqMap fB = countKmers(s2, k);
-            std::set<std::string> all_kmers;
-            for (const auto& [km, _] : fA) all_kmers.insert(km);
-            for (const auto& [km, _] : fB) all_kmers.insert(km);
+            auto runsA = countKmers_large(s1, k);
+            auto runsB = countKmers_large(s2, k);
+            std::map<uint64_t, uint32_t> mapA, mapB;
+            std::set<uint64_t> all_kmers;
+            for (const auto& r : runsA) { mapA[r.kmer] = r.count; all_kmers.insert(r.kmer); }
+            for (const auto& r : runsB) { mapB[r.kmer] = r.count; all_kmers.insert(r.kmer); }
 
             long long sum_min = 0, sum_max = 0;
             std::cout << "  k-mer   | Seq 1 | Seq 2 | min | max\n";
             std::cout << "  --------+-------+-------+-----+----\n";
-            for (const auto& km : all_kmers) {
-                int cA = fA.count(km) ? fA[km] : 0;
-                int cB = fB.count(km) ? fB[km] : 0;
+            for (uint64_t km : all_kmers) {
+                uint32_t cA = mapA.count(km) ? mapA[km] : 0;
+                uint32_t cB = mapB.count(km) ? mapB[km] : 0;
                 sum_min += std::min(cA, cB);
                 sum_max += std::max(cA, cB);
-                std::cout << "  " << std::setw(7) << std::left << km
+                std::cout << "  " << std::setw(7) << std::left << decodeKmer(km, k)
                           << " | " << std::setw(5) << std::right << cA
                           << " | " << std::setw(5) << cB
                           << " | " << std::setw(3) << std::min(cA, cB)
@@ -731,25 +728,12 @@ int main(int argc, char* argv[]) {
     std::cout << "  DNA Sequence Similarity — Jaccard Index  \n";
     std::cout << "============================================\n\n";
 
-    // Check CLI argument shortcuts
-    std::string mode = "";
-    if (argc > 1) {
-        mode = argv[1];
-    }
+    std::string mode = (argc > 1) ? argv[1] : "";
 
-    // ------------------------------------------------------------------
-    // Phase 0 — Experimental calibration to determine strategy threshold
-    // ------------------------------------------------------------------
-    CalibrationResult cal = calibrate(30000, 3);
-    g_threshold = cal.threshold;
+    // Phase 0: Calibration
+    calibrateAndVerifyStability();
 
-    std::cout << ">>> Using threshold k=" << g_threshold
-              << " (small strategy: k<" << g_threshold
-              << ", large strategy: k>=" << g_threshold << ")\n\n";
-
-    // ------------------------------------------------------------------
-    // Phase 1 — Correctness Verification Tests
-    // ------------------------------------------------------------------
+    // Phase 1: Correctness Tests
     runTests();
 
     // Direct CLI execution handlers
@@ -784,9 +768,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Enter choice [1-4]: ";
 
         int choice = 0;
-        if (!(std::cin >> choice)) {
-            break;
-        }
+        if (!(std::cin >> choice)) break;
 
         if (choice == 1) {
             runInteractiveMode();
@@ -797,7 +779,7 @@ int main(int argc, char* argv[]) {
         } else if (choice == 3) {
             runTests();
         } else if (choice == 4) {
-            std::cout << "Exiting DNA Sequence Similarity program.\n";
+            std::cout << "Exiting.\n";
             break;
         } else {
             std::cout << "Invalid choice. Please enter 1, 2, 3, or 4.\n\n";
@@ -806,4 +788,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-

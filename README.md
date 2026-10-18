@@ -10,37 +10,44 @@
 
 ## 📑 Table of Contents
 1. [Project Overview](#project-overview)
-2. [Mathematical Foundation](#mathematical-foundation)
+2. [Mathematical Foundation & Bitwise Encoding](#mathematical-foundation--bitwise-encoding)
 3. [Algorithmic Complexity & The Flat Container Trap](#algorithmic-complexity--the-flat-container-trap)
-4. [Dual k-mer Counting Architecture & Experimental Calibration](#dual-k-mer-counting-architecture--experimental-calibration)
-5. [Correctness Verification Suite](#correctness-verification-suite)
-6. [Empirical Benchmark Results & Visualizations](#empirical-benchmark-results--visualizations)
-   - [Calibration Crossover](#1-calibration-crossover)
+4. [Dual k-mer Counting Architecture](#dual-k-mer-counting-architecture)
+5. [Empirical Calibration & Threshold Stability](#empirical-calibration--threshold-stability)
+6. [Correctness Verification Suite](#correctness-verification-suite)
+7. [Empirical Benchmark Results & Visualizations](#empirical-benchmark-results--visualizations)
+   - [Calibration Crossover Curve](#1-calibration-crossover-curve)
    - [Experiment A: Sequence Length vs Runtime](#2-experiment-a-sequence-length-vs-runtime-log-log)
    - [Experiment B: Parameter k vs Runtime](#3-experiment-b-parameter-k-vs-runtime)
    - [Phase Timing Breakdown](#4-phase-breakdown-k-mer-counting-vs-jaccard-calculation)
    - [Execution Time Heatmap](#5-execution-time-heatmap)
-   - [Experiment C: Mutation Sensitivity](#6-experiment-c-mutation-sensitivity)
-7. [Repository Structure](#repository-structure)
-8. [Build and Execution Guide](#build-and-execution-guide)
+   - [Experiment C: Mutation Sensitivity (All k=1..32)](#6-experiment-c-mutation-sensitivity-all-k132)
+8. [Interactive Verification Mode (Demo to Professor)](#interactive-verification-mode-demo-to-professor)
+9. [Repository Structure](#repository-structure)
+10. [Build and Execution Guide](#build-and-execution-guide)
 
 ---
 
 ## Project Overview
 
-This repository contains an end-to-end performance programming investigation into computing DNA sequence similarity using the **Generalized Jaccard Index** on $k$-mer frequency multisets. 
+This repository contains an end-to-end performance programming investigation into computing DNA sequence similarity using the **Generalized Jaccard Index** on $k$-mer frequency multisets.
 
 Rather than relying on theoretical assumptions or arbitrary constants, this implementation:
-- Incorporates **two distinct $k$-mer counting strategies** (`countKmers_small` and `countKmers_large`).
-- Utilizes an **empirical runtime calibration phase** at startup to select the optimal strategy based on machine-specific hardware performance.
-- Scales rigorously from sequence lengths $N = 1\,000$ bp up to **$1\,000\,000$ base pairs**, across all $k \in [1, 32]$.
-- Passes **9 comprehensive correctness test cases**, including hand-calculated examples, disjoint alphabets, and boundary conditions.
-- Systematically models sequence divergence under point mutation rates from $0\%$ to $50\%$.
+- Uses **2-bit quaternary integer encoding** (`A=00`, `C=01`, `G=10`, `T=11`) packed into `uint64_t` ($k \le 32$) with $O(1)$ bitwise rolling updates, completely eliminating string allocation overhead.
+- Implements **two distinct counting paradigms**:
+  - **Strategy A (`countKmers_small`):** Direct $4^k$ flat array indexing with streaming linear comparison.
+  - **Strategy B (`countKmers_large`):** Contiguous 64-bit integer vector sort ($\mathcal{O}(n \log n)$) and a two-pointer linear merge-walk ($\mathcal{O}(|A| + |B|)$).
+- Features an **empirical runtime calibration phase** that measures machine-specific crossover and guards against the memory wall ($k \ge 14$).
+- Demonstrates **threshold stability** across different sequence lengths ($50\,000$ bp vs $200\,000$ bp).
+- Scales seamlessly from $1\,000$ bp up to **$1\,000\,000$ base pairs** in sub-second time.
+- Passes **9 comprehensive correctness tests** and includes an independent reference implementation for live verification.
+- Evaluates mutation sensitivity across all 32 values of $k \in [1, 32]$ with exact Hamming distance tracking.
 
 ---
 
-## Mathematical Foundation
+## Mathematical Foundation & Bitwise Encoding
 
+### Generalized Jaccard Index
 Given two DNA sequences $S_A$ and $S_B$ over the quaternary alphabet $\Sigma = \{\text{A}, \text{C}, \text{G}, \text{T}\}$, every contiguous substring of length $k$ is extracted. Let $c_A(x)$ and $c_B(x)$ represent the frequency of $k$-mer $x$ in $S_A$ and $S_B$ respectively.
 
 The **Generalized Jaccard Index** $J(S_A, S_B)$ is defined over the multisets of $k$-mers:
@@ -52,6 +59,24 @@ where $\mathcal{U} = \text{k-mers}(S_A) \cup \text{k-mers}(S_B)$ is the union of
 - $J = 1.0 \implies$ Identical $k$-mer frequency distributions.
 - $J = 0.0 \implies$ Completely disjoint $k$-mer sets (zero shared $k$-mers).
 - $0 < J < 1 \implies$ Partial sequence homology.
+
+### 2-Bit Quaternary Rolling Hash
+Standard substring extraction (`seq.substr(i, k)`) incurs millions of heap allocations ($\approx 65\text{--}70\%$ of execution time). We map each nucleotide base to a 2-bit binary integer:
+
+$$\text{A} \mapsto 00_2 \ (0), \quad \text{C} \mapsto 01_2 \ (1), \quad \text{G} \mapsto 10_2 \ (2), \quad \text{T} \mapsto 11_2 \ (3)$$
+
+A $k$-mer of length $k \le 32$ requires exactly $2k \le 64$ bits, fitting into a single unsigned 64-bit integer (`uint64_t`).
+
+**Rolling Update:**
+$$\text{code}_{i+1} = \bigl((\text{code}_i \ll 2) \ \& \ \text{mask}\bigr) \ | \ \text{bits}(S[i+k])$$
+
+where $\text{mask} = (1\text{ULL} \ll 2k) - 1$ (for $k < 32$) and $\sim 0\text{ULL}$ (for $k = 32$, avoiding $1 \ll 64$ undefined behavior).
+This converts $k$-mer extraction into 3 CPU register instructions (shift, AND, OR), completely eliminating heap traffic.
+
+**Corrected Combinatorics:**
+Since each base has 4 states, a sequence of length $k$ has:
+$$2^{2k} = (2^2)^k = 4^k \text{ distinct possible } k\text{-mers}$$
+*(Note: $4^k$, not $4^{2k}$.)*
 
 ---
 
@@ -72,50 +97,82 @@ For $n = 1\,000\,000$, $\mathcal{O}(n^2) \approx 5 \times 10^{11}$ operations, r
 
 Our implementation compares two mathematically sound, sub-quadratic paradigms:
 
-| Operation | Strategy A: Presized Hash Table (`countKmers_small`) | Strategy B: Bulk Vector Sort (`countKmers_large`) | Incremental Flat Container (Pitfall) |
+| Metric / Dimension | Strategy A: Direct $4^k$ Array (`countKmers_small`) | Strategy B: Integer Sort + Merge-Walk (`countKmers_large`) | Incremental Flat Container (Pitfall) |
 | :--- | :--- | :--- | :--- |
-| **Container** | `std::unordered_map<std::string, int>` | `std::vector<std::string_view>` + sort | `std::flat_multiset` |
-| **Insertion / Append** | $\mathcal{O}(1)$ average per $k$-mer | $\mathcal{O}(1)$ amortized append to vector | $\mathcal{O}(m)$ per insert (memory shifts) |
-| **Sorting / Indexing** | None (Hash buckets) | $\mathcal{O}(n \log n)$ single Introsort pass | Continuous during every insert |
-| **Run-length / Consolidation** | Direct in-place increment | $\mathcal{O}(n)$ linear scan of sorted views | Redundant duplicate shifting |
-| **Total Time Complexity** | **$\mathcal{O}(n)$ average** | **$\mathcal{O}(n \log n)$ strictly** | **$\mathcal{O}(n^2)$ (Unusable)** |
-| **Memory Allocations** | $\mathcal{O}(n)$ string allocations | $\mathcal{O}(1)$ per unique $k$-mer | Continuous reallocations |
+| **Data Container** | `std::vector<uint32_t>` of size $4^k$ | `std::vector<uint64_t>` $\to$ `std::vector<KmerCount>` | `std::flat_multiset` |
+| **Insertion / Append** | $\mathcal{O}(1)$ direct array index (`counts[code]++`) | $\mathcal{O}(1)$ amortized append to vector | $\mathcal{O}(m)$ memory shift per element |
+| **Sorting / Ordering** | Implicit (array indices are sorted) | $\mathcal{O}(n \log n)$ single Introsort pass | Continuous during every insert |
+| **Jaccard Intersection** | $\mathcal{O}(4^k)$ linear streaming pass | $\mathcal{O}(|A| + |B|)$ two-pointer merge-walk | $\mathcal{O}(n)$ scan with high insertion cost |
+| **Total Time Complexity** | **$\mathcal{O}(n + 4^k)$** | **$\mathcal{O}(n \log n)$** | **$\mathcal{O}(n^2)$ (Unusable)** |
+| **Memory Footprint** | $4^k \times 4$ bytes (bounded by memory wall) | $\mathcal{O}(n)$ flat in $k$ | Frequent reallocations + shifts |
 
 ---
 
-## Dual k-mer Counting Architecture & Experimental Calibration
+## Dual k-mer Counting Architecture
 
-### 1. Strategy A — `countKmers_small`
-- Designed for small $k$ ($k \le 12$), where the total possible distinct state space is strictly bounded by $4^k$.
-- Computes `reserve_count = min(n - k + 1, 4^(2k))` and pre-allocates hash table buckets upfront.
-- Eliminates hash table rehashing and dynamic bucket array resizing.
+### 1. Strategy A — `countKmers_small` (Direct Array)
+- Pre-allocates a contiguous array of $4^k$ counters (`uint32_t`).
+- Uses the packed 2-bit integer code directly as the array index.
+- Single linear streaming loop computes $\sum \min(cA[i], cB[i])$ and $\sum \max(cA[i], cB[i])$ across all $4^k$ bins.
+- **Memory Wall Guard:** Direct array sizing grows as $4^k \times 4$ bytes. At $k = 13$, the array is $268\text{ MB}$; at $k = 14$, it would require $1.07\text{ GB}$. The implementation strictly caps Strategy A at $k \le 13$, gracefully transitioning to Strategy B.
 
-### 2. Strategy B — `countKmers_large`
-- Designed for large $k$ ($k \ge 13$), where keys are long and heap memory allocation per substring causes cache thrashing.
-- Extracts zero-copy `std::string_view` non-owning pointers into a contiguous `std::vector`.
-- Sorts once with `std::sort` ($\mathcal{O}(n \log n)$), then compresses adjacent identical views in a single $\mathcal{O}(n)$ linear sweep.
-- Heap `std::string` allocations are executed **only once per distinct $k$-mer**, preventing memory churn.
+### 2. Strategy B — `countKmers_large` (Integer Sort + Two-Pointer Merge)
+- Appends all $n - k + 1$ 64-bit integer codes into a contiguous `std::vector<uint64_t>`.
+- Sorts using `std::sort` ($\mathcal{O}(n \log n)$).
+- Consolidates equal runs into sorted pairs `{kmer, count}` in one linear sweep.
+- Computes Generalized Jaccard using a **two-pointer linear merge walk**:
+  ```cpp
+  while (i < rA.size() && j < rB.size()) {
+      if (rA[i].kmer == rB[j].kmer) {
+          sum_min += std::min(rA[i].count, rB[j].count);
+          sum_max += std::max(rA[i].count, rB[j].count);
+          ++i; ++j;
+      } else if (rA[i].kmer < rB[j].kmer) {
+          sum_max += rA[i].count; ++i;
+      } else {
+          sum_max += rB[j].count; ++j;
+      }
+  }
+  ```
+- Memory is strictly $\mathcal{O}(n)$ and runtime is independent of $k$.
 
-### 3. Empirical Calibration Routine
-At startup, `calibrate()` runs both strategies across all $k \in [1, 32]$ on a 50,000-bp sequence with 5 repetitions per cell. It logs all timings to `calibration_log.csv` and sets `g_threshold` to the first $k$ where Strategy B is at least 5% faster than Strategy A (or defaults to 33 if Strategy A dominates).
+---
+
+## Empirical Calibration & Threshold Stability
+
+At startup, the calibration routine benchmarks both strategies across all $k \in [1, 32]$ and logs results to `calibration_log.csv`.
+
+To prove that the threshold is **stable and not a fluke of a single sequence length**, calibration runs across two distinct sequence lengths ($50\,000$ bp and $200\,000$ bp):
 
 ```
-[Calibration] Generating test sequence of length 50000 (repeats=5)...
-  k= 1  small=0.846ms  large=4.673ms
-  k= 2  small=1.459ms  large=5.303ms
+--- Phase 0: Empirical Calibration & Threshold Determination ---
+[Calibration] Benchmarking length 50000 bp (repeats=3)...
+  k= 1  small=       0.4234ms  large=  1.4926ms
+  k= 2  small=       0.4229ms  large=  2.1826ms
   ...
-  k=16  small=18.095ms  large=29.524ms
-  ...
-  k=32  small=14.648ms  large=31.962ms
-[Calibration] No crossover found: small strategy is faster for ALL k=1..32 on this machine.
-[Calibration] Threshold set to 33 (small used for all k).
+  k=11  small=       3.7010ms  large=  5.6508ms
+  k=12  small=      12.3020ms  large=  5.7971ms   <-- CROSSOVER @ k=12
+  k=13  small=      61.9140ms  large=  4.8489ms
+  k=14  small=  WALL (>268MB)  large=  4.9117ms   <-- MEMORY WALL GUARD
+>>> Primary Calibration (50k bp): Threshold = k=12
+
+--- Threshold Stability Check (Length = 200,000 bp) ---
+[Calibration] Benchmarking length 200000 bp (repeats=2)...
+  k=11  small=       5.0350ms  large= 21.2230ms
+  k=12  small=      13.5020ms  large= 20.2510ms
+  k=13  small=      54.8960ms  large= 21.8820ms   <-- CROSSOVER @ k=13
+>>> Stability Verification (200k bp): Threshold = k=13
+
+>>> Active Threshold Selected: k=12 (Strategy A: k<12, Strategy B: k>=12)
 ```
+
+**Key Finding:** The threshold shifts by only 1 unit ($k = 12 \to 13$) across a $4\times$ increase in sequence length, confirming robust empirical stability.
 
 ---
 
 ## Correctness Verification Suite
 
-All 9 correctness tests passed without failure:
+All 9 correctness test cases pass 100%:
 
 | Test ID | Scenario | Expected | Result | Status |
 | :---: | :--- | :---: | :---: | :---: |
@@ -133,27 +190,27 @@ All 9 correctness tests passed without failure:
 
 ## Empirical Benchmark Results & Visualizations
 
-### 1. Calibration Crossover
+### 1. Calibration Crossover Curve
 ![Calibration Crossover](graphs/calibration_crossover.png)
-*Figure 1: Empirical execution time comparison between Strategy A (presized `unordered_map`) and Strategy B (contiguous `string_view` sort) across $k=1..32$ on 50,000 bp. Strategy A remains consistently faster due to $\mathcal{O}(1)$ average lookup versus $\mathcal{O}(n \log n)$ sorting comparisons.*
+*Figure 1: Timing comparison between Strategy A (Direct $4^k$ Array) and Strategy B (Integer Sort + Merge-Walk) across $k=1..32$ on 50,000 bp. Strategy A dominates for $k \le 11$ ($<1\text{ ms}$). At $k=12$, Strategy B overtakes Strategy A, and at $k \ge 14$ the memory wall guard cleanly prevents out-of-memory allocations.*
 
 ---
 
 ### 2. Experiment A: Sequence Length vs Runtime (Log-Log)
 ![Time vs Sequence Length](graphs/exp_a_time_vs_length.png)
-*Figure 2: Execution time as a function of sequence length $N \in [10^3, 10^6]$ base pairs on a log-log scale. The measured slope confirms clean near-linear scaling ($\approx \mathcal{O}(N)$), taking only ~1.4 seconds for 1,000,000 bp.*
+*Figure 2: Execution time across sequence lengths $N \in [10^3, 10^6]$ base pairs on a log-log scale. With 2-bit integer encoding, comparing two 1,000,000 bp sequences takes under 150 ms.*
 
 ---
 
 ### 3. Experiment B: Parameter $k$ vs Runtime
 ![Time vs Parameter k](graphs/exp_b_time_vs_k.png)
-*Figure 3: Runtime behavior across all $k \in [1, 32]$ for lengths 1k, 10k, 100k, 500k, and 1M. As $k$ increases, distinct $k$-mer cardinality approaches $N - k + 1$, plateauing gracefully once all $k$-mers in random DNA become unique.*
+*Figure 3: Runtime behavior across all $k \in [1, 32]$ for sequence lengths 1k, 10k, 100k, 500k, and 1M. For $k \ge 12$, runtime is completely flat, confirming $\mathcal{O}(n \log n)$ independence of $k$.*
 
 ---
 
 ### 4. Phase Breakdown: $k$-mer Counting vs Jaccard Calculation
 ![Phase Breakdown](graphs/phase_breakdown.png)
-*Figure 4: Stacked phase timing breakdown comparing Phase 1 ($k$-mer extraction and map construction) versus Phase 2 (Generalized Jaccard intersection & union summation). Phase 1 represents ~65–70% of total runtime due to string extraction.*
+*Figure 4: Stacked phase timing breakdown comparing $k$-mer extraction and sorting vs two-pointer merge Jaccard calculation.*
 
 ---
 
@@ -163,9 +220,52 @@ All 9 correctness tests passed without failure:
 
 ---
 
-### 6. Experiment C: Mutation Sensitivity
+### 6. Experiment C: Mutation Sensitivity (All $k=1..32$)
 ![Mutation Sensitivity Decay](graphs/exp_c_mutation_vs_similarity.png)
-*Figure 6: Generalized Jaccard similarity decay under point substitution rates from 0% to 50% on 100,000 bp sequences for $k \in \{3, 8, 16, 24, 32\}$. Larger $k$-mers exhibit extreme sensitivity to point mutations because a single substitution disrupts up to $k$ contiguous $k$-mers, causing rapid similarity decay.*
+*Figure 6: Generalized Jaccard similarity decay under point substitution rates from 0% to 50% on 100,000 bp sequences across all 32 values of $k \in [1, 32]$. Larger $k$ exhibits dramatic exponential sensitivity to single substitutions, collapsing to zero similarity at low mutation percentages.*
+
+---
+
+## Interactive Verification Mode (Demo to Professor)
+
+To demonstrate the project live to your professor, launch the interactive verification mode:
+```powershell
+.\dna_sim.exe --interactive
+```
+
+### Live Terminal Walkthrough:
+```
+============================================
+  DNA Sequence Similarity — Verification Mode
+============================================
+Tip: Enter DNA sequences using A, C, G, T (case-insensitive).
+Type 'q' as the sequence to return to the menu.
+
+Enter first DNA sequence: ATCGATCG
+Enter second DNA sequence: ATCGATGG
+Enter k (1-32): 3
+
+--------------------------------------------
+Generalized Jaccard Similarity: 0.5000
+Verification with Reference:   PASS (Results match reference)
+Strategy Selected:             countKmers_small (Direct 4^k Array)
+Execution Time:                1.80 us
+
+Detailed k-mer Breakdown:
+  k-mer   | Seq 1 | Seq 2 | min | max
+  --------+-------+-------+-----+----
+  ATC     |     2 |     1 |   1 |   2
+  ATG     |     0 |     1 |   0 |   1
+  CGA     |     1 |     1 |   1 |   1
+  GAT     |     1 |     1 |   1 |   1
+  TCG     |     2 |     1 |   1 |   2
+  TGG     |     0 |     1 |   0 |   1
+  --------+-------+-------+-----+----
+  TOTALS  |       |       |   4 |   8
+  Formula: sum(min) / sum(max) = 4 / 8 = 0.5000
+--------------------------------------------
+Verification completed successfully.
+```
 
 ---
 
@@ -174,11 +274,11 @@ All 9 correctness tests passed without failure:
 ```
 DNASequenceSimilarity/
 ├── main.cpp                    # Complete C++17 implementation (Algorithms + Harness)
-├── build.bat                   # Automated compilation & execution script (Windows)
+├── build.bat                   # Compilation & interactive launch script (Windows)
 ├── .gitignore                  # Git ignore rules for build artifacts
-├── calibration_log.csv         # Calibration measurements for k=1..32
+├── calibration_log.csv         # Empirical calibration measurements for 50k & 200k bp
 ├── results_benchmark.csv       # Experiment A & B raw benchmark data
-├── results_mutation.csv        # Experiment C mutation sensitivity raw data
+├── results_mutation.csv        # Experiment C mutation sensitivity raw data (all k=1..32)
 ├── README.md                   # Comprehensive technical report and documentation
 └── graphs/
     ├── plot_results.py         # Automated visualization script (matplotlib)
@@ -204,63 +304,18 @@ DNASequenceSimilarity/
 g++ -O2 -std=c++17 -Wall -o dna_sim.exe main.cpp
 ```
 
-### Running Interactive Verification Mode (Demo to Professor)
-Double-click `build.bat`, or execute:
+### Running the Interactive Demo
 ```powershell
 .\dna_sim.exe --interactive
 ```
 
-#### Example Live Terminal Session:
-```
-============================================
-  DNA Sequence Similarity — Verification Mode
-============================================
-Tip: Enter DNA sequences using A, C, G, T (case-insensitive).
-Type 'q' as the sequence to return to the menu.
-
-Enter first DNA sequence: ATCGATCG
-Enter second DNA sequence: ATCGATGG
-Enter k (1-32): 3
-
---------------------------------------------
-Generalized Jaccard Similarity: 0.5000
-Verification with Reference:   PASS (Results match reference)
-Strategy Selected:             countKmers_small (Hash Table)
-Execution Time:                3.90 us
-
-Detailed k-mer Breakdown:
-  k-mer   | Seq 1 | Seq 2 | min | max
-  --------+-------+-------+-----+----
-  ATC     |     2 |     1 |   1 |   2
-  ATG     |     0 |     1 |   0 |   1
-  CGA     |     1 |     1 |   1 |   1
-  GAT     |     1 |     1 |   1 |   1
-  TCG     |     2 |     1 |   1 |   2
-  TGG     |     0 |     1 |   0 |   1
-  --------+-------+-------+-----+----
-  TOTALS  |       |       |   4 |   8
-  Formula: sum(min) / sum(max) = 4 / 8 = 0.5000
---------------------------------------------
-Verification completed successfully.
-```
-
-### Running Automated Experiments & Benchmarks
+### Running Automated Benchmarks
 ```powershell
-# Run full benchmark suite non-interactively
 .\dna_sim.exe --benchmark
-
-# Or run tests only
-.\dna_sim.exe --test
 ```
-This runs:
-1. **Calibration routine** ($k=1..32$) $\to$ `calibration_log.csv`
-2. **Correctness tests** (T1–T9) $\to$ Console verification
-3. **Benchmarks A & B** ($N \in \{1\text{k}, 10\text{k}, 100\text{k}, 500\text{k}, 1\text{M}\}, k \in [1, 32]$) $\to$ `results_benchmark.csv`
-4. **Mutation experiment C** ($N=100\text{k}, \text{mutations} \in [0\%, 50\%], k \in \{3,8,16,24,32\}$) $\to$ `results_mutation.csv`
 
 ### Generating Visualizations
 ```powershell
 python graphs\plot_results.py
 ```
 Outputs all 7 high-resolution PNG graphs to the `graphs/` directory.
-

@@ -59,14 +59,20 @@ def plot_calibration():
         return
 
     df = pd.read_csv(path)
-    small = df[df["strategy"] == "small"].sort_values("k")
-    large = df[df["strategy"] == "large"].sort_values("k")
+    # Filter for 50000 bp primary calibration
+    if "calib_len" in df.columns:
+        sub50 = df[df["calib_len"] == 50000]
+    else:
+        sub50 = df
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    small = sub50[(sub50["strategy"] == "small") & (sub50["avg_time_ms"] > 0)].sort_values("k")
+    large = sub50[sub50["strategy"] == "large"].sort_values("k")
+
+    fig, ax = plt.subplots(figsize=(11, 5.5))
     ax.plot(small["k"], small["avg_time_ms"], "o-", color=PALETTE[0],
-            label="Small-k strategy (unordered_map)", linewidth=1.8, markersize=4)
+            label="Strategy A: Direct 4^k Array", linewidth=2.0, markersize=5)
     ax.plot(large["k"], large["avg_time_ms"], "s-", color=PALETTE[1],
-            label="Large-k strategy (sorted map)", linewidth=1.8, markersize=4)
+            label="Strategy B: Integer Sort + Merge-Walk", linewidth=2.0, markersize=5)
 
     # Detect crossover
     merged = pd.merge(small[["k","avg_time_ms"]], large[["k","avg_time_ms"]],
@@ -74,16 +80,23 @@ def plot_calibration():
     cross = merged[merged["avg_time_ms_l"] < merged["avg_time_ms_s"] * 0.95]
     if not cross.empty:
         k_thresh = int(cross.iloc[0]["k"])
-        ax.axvline(k_thresh, color="#F0883E", linestyle="--", linewidth=1.4,
-                   label=f"Experimental threshold k={k_thresh}")
+        ax.axvline(k_thresh, color="#E34A33", linestyle="--", linewidth=1.8,
+                   label=f"Experimental threshold (k={k_thresh})")
+        ax.annotate(f"Crossover @ k={k_thresh}",
+                    xy=(k_thresh, cross.iloc[0]["avg_time_ms_l"]),
+                    xytext=(k_thresh + 2, cross.iloc[0]["avg_time_ms_l"] + 15),
+                    arrowprops=dict(facecolor="#E34A33", shrink=0.08, width=1.5, headwidth=7),
+                    fontweight="bold", color="#E34A33")
 
-    ax.set_xlabel("k  (k-mer length)")
-    ax.set_ylabel("Average time (ms)")
-    ax.set_title("Calibration: Small-k vs Large-k Strategy Timing")
-    ax.legend()
+    ax.axvspan(13.5, 32.5, color="#f0f0f0", alpha=0.5, label="Memory Wall (>268 MB array)")
+    ax.set_xlabel("k (k-mer length)")
+    ax.set_ylabel("Average Time (ms)")
+    ax.set_title("Calibration Crossover: Strategy A (Direct Array) vs Strategy B (Integer Sort)")
+    ax.legend(loc="upper left")
     ax.grid(True)
     ax.set_xticks(range(1, 33))
     savefig("calibration_crossover.png")
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # 2. Experiment A: Execution time vs Sequence length for selected k
@@ -181,20 +194,29 @@ def plot_exp_c():
     avg = df.groupby(["k", "mutation_pct"])["similarity"].mean().reset_index()
     k_vals = sorted(avg["k"].unique())
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, k in enumerate(k_vals):
+    fig, ax = plt.subplots(figsize=(11, 6))
+    highlight_k = {1, 2, 4, 8, 12, 16, 20, 24, 28, 32}
+    cmap = matplotlib.colormaps.get_cmap("viridis")
+
+    for k in k_vals:
         sub = avg[avg["k"] == k].sort_values("mutation_pct")
-        ax.plot(sub["mutation_pct"], sub["similarity"], "o-",
-                color=PALETTE[i % len(PALETTE)],
-                label=f"k={k}", linewidth=1.8, markersize=5)
+        norm_k = (k - 1) / 31.0
+        c = cmap(norm_k)
+        if k in highlight_k or len(k_vals) <= 10:
+            ax.plot(sub["mutation_pct"], sub["similarity"], "o-",
+                    color=c, label=f"k={k}", linewidth=2.0, markersize=5)
+        else:
+            ax.plot(sub["mutation_pct"], sub["similarity"], "-",
+                    color=c, alpha=0.35, linewidth=1.0)
 
     ax.set_xlabel("Mutation Percentage  (%)")
     ax.set_ylabel("Generalized Jaccard Similarity")
-    ax.set_title("Experiment C — Similarity vs Mutation Rate")
+    ax.set_title("Experiment C — Sensitivity Decay across all k in [1, 32]")
     ax.set_ylim(-0.05, 1.05)
-    ax.legend(title="k value")
+    ax.legend(title="Selected k values", ncol=2, loc="upper right")
     ax.grid(True)
     savefig("exp_c_mutation_vs_similarity.png")
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # 6. Heatmap: avg total_ms  [seq_len x k]

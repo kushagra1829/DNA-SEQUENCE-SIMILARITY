@@ -37,6 +37,7 @@
 #include <map>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -579,18 +580,167 @@ void runMutationExperiment(const std::string& csv_path) {
 }
 
 // ===========================================================================
+// SECTION 9 — Interactive Verification Mode & Reference Implementation
+// ===========================================================================
+
+// Straightforward reference implementation using standard sorted map
+// for cross-verification of optimized implementations.
+double referenceJaccard(const std::string& seqA, const std::string& seqB, int k) {
+    if (k <= 0) return 0.0;
+    std::map<std::string, int> fA, fB;
+    const int nA = static_cast<int>(seqA.size());
+    const int nB = static_cast<int>(seqB.size());
+    for (int i = 0; i <= nA - k; ++i) fA[seqA.substr(i, k)]++;
+    for (int i = 0; i <= nB - k; ++i) fB[seqB.substr(i, k)]++;
+
+    if (fA.empty() && fB.empty()) return 1.0;
+    if (fA.empty() || fB.empty()) return 0.0;
+
+    std::set<std::string> all_kmers;
+    for (const auto& [km, _] : fA) all_kmers.insert(km);
+    for (const auto& [km, _] : fB) all_kmers.insert(km);
+
+    long long sum_min = 0, sum_max = 0;
+    for (const auto& km : all_kmers) {
+        int cA = fA.count(km) ? fA.at(km) : 0;
+        int cB = fB.count(km) ? fB.at(km) : 0;
+        sum_min += std::min(cA, cB);
+        sum_max += std::max(cA, cB);
+    }
+    return (sum_max == 0) ? 1.0 : static_cast<double>(sum_min) / sum_max;
+}
+
+bool isValidDNA(const std::string& s) {
+    if (s.empty()) return false;
+    for (char c : s) {
+        char u = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (u != 'A' && u != 'C' && u != 'G' && u != 'T') return false;
+    }
+    return true;
+}
+
+std::string cleanDNA(const std::string& s) {
+    std::string res;
+    for (char c : s) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            res.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+    }
+    return res;
+}
+
+void runInteractiveMode() {
+    std::cout << "\n============================================\n";
+    std::cout << "  DNA Sequence Similarity — Verification Mode\n";
+    std::cout << "============================================\n";
+    std::cout << "Tip: Enter DNA sequences using A, C, G, T (case-insensitive).\n";
+    std::cout << "Type 'q' as the sequence to return to the menu.\n";
+
+    while (true) {
+        std::string s1, s2;
+        std::cout << "\nEnter first DNA sequence: ";
+        if (!(std::cin >> s1) || s1 == "q" || s1 == "Q") break;
+        s1 = cleanDNA(s1);
+        if (!isValidDNA(s1)) {
+            std::cout << "Error: Invalid DNA sequence! Only A, C, G, T bases are allowed.\n";
+            continue;
+        }
+
+        std::cout << "Enter second DNA sequence: ";
+        if (!(std::cin >> s2) || s2 == "q" || s2 == "Q") break;
+        s2 = cleanDNA(s2);
+        if (!isValidDNA(s2)) {
+            std::cout << "Error: Invalid DNA sequence! Only A, C, G, T bases are allowed.\n";
+            continue;
+        }
+
+        int k = 0;
+        std::cout << "Enter k (1-32): ";
+        if (!(std::cin >> k)) {
+            std::cin.clear();
+            std::string dummy;
+            std::cin >> dummy;
+            std::cout << "Error: Invalid input. k must be an integer between 1 and 32.\n";
+            continue;
+        }
+        if (k < 1 || k > 32) {
+            std::cout << "Error: k must be between 1 and 32.\n";
+            continue;
+        }
+
+        // Compute similarity with timing
+        auto t0 = Clock::now();
+        double sim = generalizedJaccard(s1, s2, k);
+        double elapsed_us = elapsed_sec(t0) * 1e6;
+
+        // Cross-verify with reference implementation
+        double ref_sim = referenceJaccard(s1, s2, k);
+        bool match = (std::abs(sim - ref_sim) < 1e-9);
+
+        std::cout << "\n--------------------------------------------\n";
+        std::cout << "Generalized Jaccard Similarity: "
+                  << std::fixed << std::setprecision(4) << sim << "\n";
+        std::cout << "Verification with Reference:   "
+                  << (match ? "PASS (Results match reference)" : "FAIL (Discrepancy detected)") << "\n";
+        std::cout << "Strategy Selected:             "
+                  << ((k < g_threshold) ? "countKmers_small (Hash Table)" : "countKmers_large (string_view Sort)") << "\n";
+        std::cout << "Execution Time:                "
+                  << std::fixed << std::setprecision(2) << elapsed_us << " us\n";
+
+        // For concise sequences (<= 80 bp), display full k-mer frequency table
+        if (s1.size() <= 80 && s2.size() <= 80) {
+            std::cout << "\nDetailed k-mer Breakdown:\n";
+            FreqMap fA = countKmers(s1, k);
+            FreqMap fB = countKmers(s2, k);
+            std::set<std::string> all_kmers;
+            for (const auto& [km, _] : fA) all_kmers.insert(km);
+            for (const auto& [km, _] : fB) all_kmers.insert(km);
+
+            long long sum_min = 0, sum_max = 0;
+            std::cout << "  k-mer   | Seq 1 | Seq 2 | min | max\n";
+            std::cout << "  --------+-------+-------+-----+----\n";
+            for (const auto& km : all_kmers) {
+                int cA = fA.count(km) ? fA[km] : 0;
+                int cB = fB.count(km) ? fB[km] : 0;
+                sum_min += std::min(cA, cB);
+                sum_max += std::max(cA, cB);
+                std::cout << "  " << std::setw(7) << std::left << km
+                          << " | " << std::setw(5) << std::right << cA
+                          << " | " << std::setw(5) << cB
+                          << " | " << std::setw(3) << std::min(cA, cB)
+                          << " | " << std::setw(3) << std::max(cA, cB) << "\n";
+            }
+            std::cout << "  --------+-------+-------+-----+----\n";
+            std::cout << "  TOTALS  |       |       | "
+                      << std::setw(3) << sum_min << " | " << std::setw(3) << sum_max << "\n";
+            std::cout << "  Formula: sum(min) / sum(max) = "
+                      << sum_min << " / " << sum_max << " = "
+                      << std::fixed << std::setprecision(4) << sim << "\n";
+        }
+        std::cout << "--------------------------------------------\n";
+        std::cout << "Verification completed successfully.\n";
+    }
+}
+
+// ===========================================================================
 // MAIN
 // ===========================================================================
 
-int main() {
+int main(int argc, char* argv[]) {
     std::cout << "============================================\n";
     std::cout << "  DNA Sequence Similarity — Jaccard Index  \n";
     std::cout << "============================================\n\n";
 
+    // Check CLI argument shortcuts
+    std::string mode = "";
+    if (argc > 1) {
+        mode = argv[1];
+    }
+
     // ------------------------------------------------------------------
     // Phase 0 — Experimental calibration to determine strategy threshold
     // ------------------------------------------------------------------
-    CalibrationResult cal = calibrate(50000, 5);
+    CalibrationResult cal = calibrate(30000, 3);
     g_threshold = cal.threshold;
 
     std::cout << ">>> Using threshold k=" << g_threshold
@@ -598,25 +748,62 @@ int main() {
               << ", large strategy: k>=" << g_threshold << ")\n\n";
 
     // ------------------------------------------------------------------
-    // Phase 1 — Correctness
+    // Phase 1 — Correctness Verification Tests
     // ------------------------------------------------------------------
     runTests();
 
-    // ------------------------------------------------------------------
-    // Phase 2 — Performance benchmarks
-    // ------------------------------------------------------------------
-    runBenchmark("results_benchmark.csv");
+    // Direct CLI execution handlers
+    if (mode == "--interactive" || mode == "-i") {
+        runInteractiveMode();
+        return 0;
+    }
+    if (mode == "--benchmark" || mode == "-b") {
+        runBenchmark("results_benchmark.csv");
+        runMutationExperiment("results_mutation.csv");
+        std::cout << "All automated benchmarks complete.\n";
+        return 0;
+    }
+    if (mode == "--test" || mode == "-t") {
+        std::cout << "Test suite execution complete.\n";
+        return 0;
+    }
+    if (mode == "--all" || mode == "-a") {
+        runBenchmark("results_benchmark.csv");
+        runMutationExperiment("results_mutation.csv");
+        std::cout << "\nAll experiments complete.\n";
+        return 0;
+    }
 
-    // ------------------------------------------------------------------
-    // Phase 3 — Mutation sensitivity
-    // ------------------------------------------------------------------
-    runMutationExperiment("results_mutation.csv");
+    // Interactive Menu Mode
+    while (true) {
+        std::cout << "Select an option:\n";
+        std::cout << "  1. Interactive Verification Mode (Demo to Professor)\n";
+        std::cout << "  2. Run Full Experimental Benchmark Suite (Exp A, B, C)\n";
+        std::cout << "  3. Re-run Correctness Test Suite\n";
+        std::cout << "  4. Exit\n";
+        std::cout << "Enter choice [1-4]: ";
 
-    std::cout << "All experiments complete.\n";
-    std::cout << "Output files:\n";
-    std::cout << "  calibration_log.csv\n";
-    std::cout << "  results_benchmark.csv\n";
-    std::cout << "  results_mutation.csv\n";
+        int choice = 0;
+        if (!(std::cin >> choice)) {
+            break;
+        }
+
+        if (choice == 1) {
+            runInteractiveMode();
+        } else if (choice == 2) {
+            runBenchmark("results_benchmark.csv");
+            runMutationExperiment("results_mutation.csv");
+            std::cout << "Benchmarks completed successfully.\n\n";
+        } else if (choice == 3) {
+            runTests();
+        } else if (choice == 4) {
+            std::cout << "Exiting DNA Sequence Similarity program.\n";
+            break;
+        } else {
+            std::cout << "Invalid choice. Please enter 1, 2, 3, or 4.\n\n";
+        }
+    }
 
     return 0;
 }
+

@@ -204,11 +204,55 @@ DNASequenceSimilarity/
 g++ -O2 -std=c++17 -Wall -o dna_sim.exe main.cpp
 ```
 
-### Running Experiments
+### Running Interactive Verification Mode (Demo to Professor)
+Double-click `build.bat`, or execute:
 ```powershell
-.\dna_sim.exe
+.\dna_sim.exe --interactive
 ```
-This automatically runs:
+
+#### Example Live Terminal Session:
+```
+============================================
+  DNA Sequence Similarity — Verification Mode
+============================================
+Tip: Enter DNA sequences using A, C, G, T (case-insensitive).
+Type 'q' as the sequence to return to the menu.
+
+Enter first DNA sequence: ATCGATCG
+Enter second DNA sequence: ATCGATGG
+Enter k (1-32): 3
+
+--------------------------------------------
+Generalized Jaccard Similarity: 0.5000
+Verification with Reference:   PASS (Results match reference)
+Strategy Selected:             countKmers_small (Hash Table)
+Execution Time:                3.90 us
+
+Detailed k-mer Breakdown:
+  k-mer   | Seq 1 | Seq 2 | min | max
+  --------+-------+-------+-----+----
+  ATC     |     2 |     1 |   1 |   2
+  ATG     |     0 |     1 |   0 |   1
+  CGA     |     1 |     1 |   1 |   1
+  GAT     |     1 |     1 |   1 |   1
+  TCG     |     2 |     1 |   1 |   2
+  TGG     |     0 |     1 |   0 |   1
+  --------+-------+-------+-----+----
+  TOTALS  |       |       |   4 |   8
+  Formula: sum(min) / sum(max) = 4 / 8 = 0.5000
+--------------------------------------------
+Verification completed successfully.
+```
+
+### Running Automated Experiments & Benchmarks
+```powershell
+# Run full benchmark suite non-interactively
+.\dna_sim.exe --benchmark
+
+# Or run tests only
+.\dna_sim.exe --test
+```
+This runs:
 1. **Calibration routine** ($k=1..32$) $\to$ `calibration_log.csv`
 2. **Correctness tests** (T1–T9) $\to$ Console verification
 3. **Benchmarks A & B** ($N \in \{1\text{k}, 10\text{k}, 100\text{k}, 500\text{k}, 1\text{M}\}, k \in [1, 32]$) $\to$ `results_benchmark.csv`
@@ -219,3 +263,4 @@ This automatically runs:
 python graphs\plot_results.py
 ```
 Outputs all 7 high-resolution PNG graphs to the `graphs/` directory.
+
